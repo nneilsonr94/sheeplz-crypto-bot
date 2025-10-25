@@ -1,0 +1,12 @@
+[submodule "external/pantheon-server"]
+	path = external/pantheon-server
+	url = https://github.com/SpartanDigitalDotNet/pantheon-server.git
+[submodule "external/resonance-ai-scanner-net"]
+	path = external/resonance-ai-scanner-net
+	url = https://github.com/SpartanDigitalDotNet/resonance.ai.scanner.net.git
+[submodule "external/Tradingview"]
+	path = external/Tradingview
+	url = https://github.com/SpartanDigitalDotNet/Tradingview.git
+[submodule "external/resonance-ai-scannerv13"]
+	path = external/resonance-ai-scannerv13
+	url = https://github.com/metteyyaX/resonance.ai-scannerv13.git
