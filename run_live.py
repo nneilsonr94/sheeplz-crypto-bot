@@ -18,6 +18,7 @@ import torch
 from config import EnvironmentConfig
 from exchanges.kraken_client import KrakenClient
 from exchanges.position_manager import PositionManager, PositionLimits
+from integrations.tradingview_adapter import PriceBuffer, get_signal_from_prices, signal_to_action
 from agent import MetaSACAgent
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,8 @@ def main():
 
     logger.info(f"Starting live loop for {SYMBOL} (DRY_RUN={DRY_RUN})")
     time_step = 0
+    # small price buffer used by the TradingView adapter
+    price_buffer = PriceBuffer(size=int(os.getenv('TV_WINDOW', '20')))
 
     try:
         while True:
@@ -75,6 +78,9 @@ def main():
                 continue
 
             state = make_state_from_ticker(ticker, cfg)
+            # update price buffer
+            last_price = float(ticker.get('last', 0.0) or 0.0)
+            price_buffer.add(last_price)
 
             # create dummy graph inputs required by agent.select_action
             edge_index = torch.tensor([[0], [0]], dtype=torch.long)
@@ -85,16 +91,24 @@ def main():
             # agent.select_action may return a scalar or vector depending on actor
             a_value = float(np.asarray(action).squeeze().item()) if hasattr(action, 'squeeze') or isinstance(action, (list, tuple, np.ndarray)) else float(action)
 
+            # Get TradingView-derived signal and convert to an action
+            tv_signal = get_signal_from_prices(price_buffer.to_list())
+            tv_action = signal_to_action(tv_signal)
+
             # safety deadband
             deadband = float(os.getenv('DEADBAND', '0.02'))
-            if abs(a_value) < deadband:
-                logger.info(f"Action {a_value:.4f} within deadband {deadband}; no trade")
+            # combine agent action with TradingView adapter action conservatively
+            # weighted average: agent (0.7), tradingview (0.3)
+            combined_action = float(max(min(0.7 * a_value + 0.3 * tv_action, 1.0), -1.0))
+
+            if abs(combined_action) < deadband:
+                logger.info(f"Combined action {combined_action:.4f} within deadband {deadband}; no trade (agent={a_value:.4f}, tv={tv_action:.4f}, signal={tv_signal})")
             else:
-                order_info = kraken.action_to_order(a_value, SYMBOL, max_order_usd=MAX_ORDER_USD)
+                order_info = kraken.action_to_order(combined_action, SYMBOL, max_order_usd=MAX_ORDER_USD)
                 if order_info.get('side') is None or order_info.get('amount', 0) <= 0:
-                    logger.info(f"No order created from action {a_value}")
+                    logger.info(f"No order created from combined action {combined_action}")
                 else:
-                    logger.info(f"Placing order (pre-checks): {order_info}")
+                    logger.info(f"Placing order (pre-checks): {order_info} (agent={a_value:.4f}, tv={tv_action:.4f}, signal={tv_signal})")
                     # Safety: check position manager limits
                     if posman.would_exceed_limits(order_info['side'], order_info['amount'], order_info['price']):
                         logger.warning("Order would exceed configured position limits; skipping")
