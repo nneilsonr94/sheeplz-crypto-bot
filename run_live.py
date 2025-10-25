@@ -18,7 +18,7 @@ import torch
 from config import EnvironmentConfig
 from exchanges.kraken_client import KrakenClient
 from exchanges.position_manager import PositionManager, PositionLimits
-from integrations.tradingview_adapter import PriceBuffer, get_signal_from_prices, signal_to_action
+from integrations.tradingview_adapter import PriceBuffer, VolumeBuffer, combine_indicators_to_action
 from agent import MetaSACAgent
 
 logger = logging.getLogger(__name__)
@@ -65,8 +65,9 @@ def main():
 
     logger.info(f"Starting live loop for {SYMBOL} (DRY_RUN={DRY_RUN})")
     time_step = 0
-    # small price buffer used by the TradingView adapter
+    # small price/volume buffers used by the TradingView adapter
     price_buffer = PriceBuffer(size=int(os.getenv('TV_WINDOW', '20')))
+    volume_buffer = VolumeBuffer(size=int(os.getenv('TV_WINDOW', '20')))
 
     try:
         while True:
@@ -80,7 +81,9 @@ def main():
             state = make_state_from_ticker(ticker, cfg)
             # update price buffer
             last_price = float(ticker.get('last', 0.0) or 0.0)
+            last_vol = float(ticker.get('volume', 0.0) or 0.0)
             price_buffer.add(last_price)
+            volume_buffer.add(last_vol)
 
             # create dummy graph inputs required by agent.select_action
             edge_index = torch.tensor([[0], [0]], dtype=torch.long)
@@ -92,8 +95,15 @@ def main():
             a_value = float(np.asarray(action).squeeze().item()) if hasattr(action, 'squeeze') or isinstance(action, (list, tuple, np.ndarray)) else float(action)
 
             # Get TradingView-derived signal and convert to an action
-            tv_signal = get_signal_from_prices(price_buffer.to_list())
-            tv_action = signal_to_action(tv_signal)
+            # derive TV action via ported indicators combiner
+            tv_action = combine_indicators_to_action(price_buffer.to_list(), volume_buffer.to_list())
+            # textual TV signal for logging
+            if tv_action > 0.05:
+                tv_signal = 'buy'
+            elif tv_action < -0.05:
+                tv_signal = 'sell'
+            else:
+                tv_signal = 'none'
 
             # safety deadband
             deadband = float(os.getenv('DEADBAND', '0.02'))
