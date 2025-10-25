@@ -40,4 +40,4 @@ class EnvironmentConfig:
     kraken_api_secret: Optional[str] = None
     kraken_dry_run: bool = True
     kraken_symbol: str = "XBT/USD"
-    kraken_max_order_usd: float = 100.0
+    kraken_max_order_usd: float = 10.0

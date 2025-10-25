@@ -43,7 +43,7 @@ def make_state_from_ticker(ticker: dict, config: EnvironmentConfig) -> Any:
 
 def main():
     SYMBOL = os.getenv('SYMBOL', 'XBT/USD')  # change to your preferred symbol
-    MAX_ORDER_USD = float(os.getenv('MAX_ORDER_USD', '100'))
+    MAX_ORDER_USD = float(os.getenv('MAX_ORDER_USD', '10'))
     DRY_RUN = bool(str(os.getenv('DRY_RUN', 'true')).lower() in ('1', 'true', 'yes'))
 
     # init client
