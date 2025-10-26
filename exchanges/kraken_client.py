@@ -131,6 +131,11 @@ class KrakenClient:
             precision = market.get("precision", {})
             base_prec = precision.get("amount")
             if base_prec is not None:
-                amount = float(round(amount, base_prec))
+                try:
+                    base_prec_int = int(base_prec)
+                except Exception:
+                    # if precision is not an integer, coerce gracefully
+                    base_prec_int = 8
+                amount = float(round(amount, base_prec_int))
 
         return {"side": side, "amount": amount, "price": price, "usd_notional": usd}

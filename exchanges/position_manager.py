@@ -14,6 +14,9 @@ class PositionLimits:
     max_notional_usd: float = 1000.0  # maximum USD exposure
     max_base_amount: Optional[float] = None  # optional cap on base currency
     min_order_usd: float = 1.0
+    cooldown_seconds: float = 5.0  # minimal seconds between simulated trades
+    stop_loss_pct: Optional[float] = None  # e.g. 0.05 for 5% stop loss
+    take_profit_pct: Optional[float] = None  # e.g. 0.1 for 10% take profit
 
 
 class PositionManager:
@@ -22,6 +25,8 @@ class PositionManager:
         # Track position as signed base amount (positive = long/buy, negative = short/sell)
         self.position_base = 0.0
         self.avg_entry_price = None
+        self._last_trade_ts = 0.0
+        self.audit_path = None
 
     def current_position(self):
         return {"base": self.position_base, "avg_entry_price": self.avg_entry_price}
@@ -44,8 +49,52 @@ class PositionManager:
 
         return False
 
+    def can_trade(self, now_ts: Optional[float] = None) -> bool:
+        """Return False if trade cooldown is in effect."""
+        now = now_ts or __import__('time').time()
+        if self.limits.cooldown_seconds and (now - self._last_trade_ts) < float(self.limits.cooldown_seconds):
+            return False
+        return True
+
+    def should_close_for_sl_tp(self, current_price: float):
+        """
+        Check whether the current position should be closed because of stop-loss or take-profit.
+        Returns a tuple (should_close: bool, side_to_close: str, amount_base: float) or (False, None, 0.0).
+        """
+        if self.position_base == 0 or self.avg_entry_price is None:
+            return False, None, 0.0
+        # long position
+        if self.position_base > 0:
+            if self.limits.stop_loss_pct is not None:
+                if current_price <= self.avg_entry_price * (1.0 - float(self.limits.stop_loss_pct)):
+                    return True, 'sell', abs(self.position_base)
+            if self.limits.take_profit_pct is not None:
+                if current_price >= self.avg_entry_price * (1.0 + float(self.limits.take_profit_pct)):
+                    return True, 'sell', abs(self.position_base)
+        else:
+            # short position
+            if self.limits.stop_loss_pct is not None:
+                if current_price >= self.avg_entry_price * (1.0 + float(self.limits.stop_loss_pct)):
+                    return True, 'buy', abs(self.position_base)
+            if self.limits.take_profit_pct is not None:
+                if current_price <= self.avg_entry_price * (1.0 - float(self.limits.take_profit_pct)):
+                    return True, 'buy', abs(self.position_base)
+        return False, None, 0.0
+
     def record_trade(self, side: str, amount_base: float, price: float) -> None:
-        """Record an executed trade (updates position). Assumes trade executed successfully."""
+        """Record an executed trade (updates position) and stamp the trade time; also audit to file if configured."""
+        # stamp trade time
+        import time as _time
+        self._last_trade_ts = _time.time()
+        # persist audit if requested
+        try:
+            if self.audit_path:
+                import json
+                with open(self.audit_path, 'a') as fh:
+                    fh.write(json.dumps({'ts': self._last_trade_ts, 'side': side, 'amount': amount_base, 'price': price}) + "\n")
+        except Exception:
+            pass
+        # delegate to existing logic to update position
         # update avg entry price via simple weighted average for the position
         signed_amount = amount_base if side == "buy" else -amount_base
         if self.position_base == 0 or (self.position_base > 0 and signed_amount > 0) or (self.position_base < 0 and signed_amount < 0):
@@ -70,3 +119,6 @@ class PositionManager:
             if abs(self.position_base) < 1e-12:
                 self.position_base = 0.0
                 self.avg_entry_price = None
+
+
+    
