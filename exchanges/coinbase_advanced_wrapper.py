@@ -57,6 +57,8 @@ def _find_candidate_module():
         'coinbase_advancedtrade',
         'coinbase_advanced_trade',
         'coinbase_advanced',
+        'coinbase_advanced_trader',
+        'coinbase_advanced_py',
         'advancedtrade',
         'coinbase_advancedtrade_python',
         'coinbase',
@@ -127,6 +129,16 @@ def get_client(api_key: Optional[str] = None, api_secret: Optional[str] = None, 
         logger.warning("Installed Coinbase AdvancedTrade module found but no usable factory/class detected; using dry-run stub. If you installed the library, please open an issue or provide the constructor name so I can adapt this wrapper.")
         return _StubClient()
 
+    # Detect Enhanced-like clients (they expose high-level fiat helpers). Prefer
+    # using fiat_market_buy / fiat_market_sell when present. We don't require
+    # importing the third-party class; instead, probe the instantiated client
+    # for the helper methods so test doubles work as expected.
+    try:
+        enhanced_cls = None
+        enhanced_present = hasattr(client_obj, 'fiat_market_buy') or hasattr(client_obj, 'fiat_market_sell')
+    except Exception:
+        enhanced_present = False
+
     # Wrap the client to a uniform surface
     class _Wrapper:
         def __init__(self, client):
@@ -135,36 +147,97 @@ def get_client(api_key: Optional[str] = None, api_secret: Optional[str] = None, 
             self.markets = getattr(client, 'markets', {}) or getattr(client, 'symbols', {}) or {}
 
         def fetch_ticker(self, symbol: str):
-            # try a few method names
-            for meth in ('fetch_ticker', 'get_ticker', 'ticker', 'get_ticker_for_symbol'):
+            # try a few method names (cover common client variants)
+            fetch_candidates = (
+                'fetch_ticker', 'get_ticker', 'ticker', 'get_ticker_for_symbol',
+                'get_product_ticker', 'get_product', 'get_latest_price', 'get_price', 'get_market_price', 'price', 'ticker_for'
+            )
+            for meth in fetch_candidates:
+                fn = getattr(self._c, meth, None)
+                if callable(fn):
+                    # try common call signatures
+                    for args, kwargs in (([symbol], {}), ([], {'product_id': symbol}), ([], {'symbol': symbol}), ([], {})):
+                        try:
+                            res = fn(*args, **kwargs)
+                            # normalize simple numeric responses
+                            if isinstance(res, (int, float, str)):
+                                return {'last': str(res), 'volume': '0'}
+                            return res
+                        except TypeError:
+                            continue
+                        except Exception:
+                            # if the method exists but failed, try next candidate
+                            break
+            # last resort: try raw REST-like call
+            for meth in ('get_market_price', 'get_price', 'price'):
                 fn = getattr(self._c, meth, None)
                 if callable(fn):
                     try:
-                        return fn(symbol)
+                        p = fn(symbol)
+                        return {'last': str(p), 'volume': '0'}
                     except Exception:
                         continue
-            # last resort: try raw REST-like call
-            if hasattr(self._c, 'get_market_price'):
-                try:
-                    p = self._c.get_market_price(symbol)
-                    return {'last': str(p), 'volume': '0'}
-                except Exception:
-                    pass
             # fallback
             return {'last': '0', 'volume': '0'}
 
         def create_market_order(self, symbol: str, side: str, amount: float, params: Optional[dict] = None):
-            for meth in ('create_order', 'place_order', 'submit_order', 'market_order'):
+            # If this is an EnhancedRESTClient instance, use its higher-level fiat helpers
+            try:
+                if enhanced_present:
+                    # Enhanced-style clients expose fiat_market_buy / fiat_market_sell
+                    # which accept fiat_amount strings. Compute a fiat amount from
+                    # params if present, otherwise use amount*price when possible.
+                    fiat_amount = ''
+                    if params and params.get('usd_notional'):
+                        try:
+                            fiat_amount = str(float(params.get('usd_notional')))
+                        except Exception:
+                            fiat_amount = ''
+                    elif params and params.get('price'):
+                        try:
+                            fiat_amount = str(amount * float(params.get('price')))
+                        except Exception:
+                            fiat_amount = ''
+                    # final fallback
+                    if not fiat_amount:
+                        fiat_amount = str(0.0)
+                    if side == 'buy' and hasattr(self._c, 'fiat_market_buy'):
+                        logger.info('Using Enhanced-style fiat_market_buy for symbol=%s fiat_amount=%s', symbol, fiat_amount)
+                        return getattr(self._c, 'fiat_market_buy')(symbol, fiat_amount)
+                    elif side == 'sell' and hasattr(self._c, 'fiat_market_sell'):
+                        logger.info('Using Enhanced-style fiat_market_sell for symbol=%s fiat_amount=%s', symbol, fiat_amount)
+                        return getattr(self._c, 'fiat_market_sell')(symbol, fiat_amount)
+            except Exception:
+                # if Enhanced-style attempt fails, fall back to generic attempts below
+                pass
+
+            # broaden signature attempts to handle different client APIs
+            order_candidates = (
+                'create_order', 'place_order', 'submit_order', 'market_order', 'create_market_order',
+                'place_market_order', 'new_order', 'place_trade', 'create_trade', 'submit_trade'
+            )
+            for meth in order_candidates:
                 fn = getattr(self._c, meth, None)
                 if callable(fn):
-                    try:
-                        # try common signatures
+                    # try several common signatures
+                    sig_attempts = [
+                        ((symbol, 'market', side, amount, params or {}), {}),
+                        ((side, amount, symbol), {}),
+                        ((symbol, side, amount), {}),
+                        ((), {'product_id': symbol, 'side': side, 'size': amount}),
+                        ((), {'product_id': symbol, 'side': side, 'size': amount, **(params or {})}),
+                        ((), {'symbol': symbol, 'side': side, 'amount': amount}),
+                        ((), {'order_type': 'market', 'product_id': symbol, 'size': amount, 'side': side}),
+                        ((symbol, amount), {'side': side}),
+                    ]
+                    for args, kwargs in sig_attempts:
                         try:
-                            return fn(symbol, 'market', side, amount, params or {})
+                            return fn(*args, **kwargs)
                         except TypeError:
-                            return fn(side=side, size=amount, product_id=symbol)
-                    except Exception:
-                        continue
+                            continue
+                        except Exception:
+                            # method exists but raised; try next signature/method
+                            break
             # fallback: return dry-run style dict
             return {'info': {'dry_run': True}, 'symbol': symbol, 'side': side, 'amount': amount}
 
