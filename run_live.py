@@ -13,17 +13,46 @@ import logging
 from typing import Any
 
 import numpy as np
-import torch
 
 from config import EnvironmentConfig
 from exchanges.exchange_factory import get_exchange_client
 from exchanges.position_manager import PositionManager, PositionLimits
 from integrations.tradingview_adapter import PriceBuffer, VolumeBuffer, combine_indicators_to_action
-from agent import MetaSACAgent
-from env.environment import HistoricalEnvironment
+
+# Try to import heavy dependencies (torch, agent, environment). If unavailable,
+# provide lightweight local stubs so the demo can run in minimal environments.
+try:
+    import torch
+    from agent import MetaSACAgent
+    from env.environment import HistoricalEnvironment
+    HAS_HEAVY_DEPS = True
+except Exception:
+    HAS_HEAVY_DEPS = False
+
+    class HistoricalEnvironment:
+        def __init__(self, data):
+            self._data = data
+            self._i = 0
+
+        def reset(self):
+            self._i = 0
+            return self._data[self._i]
+
+        def step(self, action, step_idx=0):
+            self._i = min(self._i + 1, len(self._data) - 1)
+            done = self._i >= (len(self._data) - 1)
+            return self._data[self._i], 0.0, done, {}
+
+    class MetaSACAgent:
+        def __init__(self, config, env=None):
+            self.config = config
+
+        def select_action(self, *args, **kwargs):
+            return 0.0
 import joblib
 from integrations.indicators_tv import auto_fib_levels, watchtower_signal, believe_it_meter, livermore_3_points
 from models.feature_builder import build_feature_from_window
+from exchanges.exchange_utils import execute_with_cb
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s:%(message)s')
@@ -64,14 +93,63 @@ def main():
     # init client via factory (select exchange via EXCHANGE env var, default 'kraken')
     EXCHANGE_ID = os.getenv('EXCHANGE', 'kraken')
     MARKET_TYPE = os.getenv('MARKET_TYPE', 'spot')
-    kraken = get_exchange_client(
-        EXCHANGE_ID,
-        api_key=os.getenv('EXCHANGE_API_KEY') or os.getenv('KRAKEN_API_KEY'),
-        api_secret=os.getenv('EXCHANGE_API_SECRET') or os.getenv('KRAKEN_API_SECRET'),
-        api_passphrase=os.getenv('EXCHANGE_API_PASSPHRASE') or os.getenv('KRAKEN_API_PASSPHRASE'),
-        testnet=False,
-        dry_run=DRY_RUN,
-    )
+    # Optionally use a fake exchange for demos/testing to simulate failures
+    USE_FAKE = bool(str(os.getenv('USE_FAKE_EXCHANGE', 'false')).lower() in ('1', 'true', 'yes'))
+    if USE_FAKE:
+        import random
+
+        class FakeExchange:
+            def __init__(self):
+                # provide a minimal markets mapping so resolve_symbol can work
+                self.markets = {SYMBOL: {}}
+                self._price = 50000.0
+                # deterministic fail-every-N counter
+                self._fail_counter = 0
+
+            def fetch_ticker(self, symbol):
+                # simple deterministic-ish tick: small random walk
+                self._price += random.uniform(-5.0, 5.0)
+                return {'last': self._price, 'volume': random.uniform(0.1, 10.0)}
+
+            def action_to_order(self, combined_action, symbol, max_order_usd=10):
+                side = 'buy' if combined_action > 0 else 'sell'
+                # map action magnitude to notional up to max_order_usd
+                amount = max(0.0, abs(combined_action)) * (max_order_usd / max(1.0, self._price))
+                return {'side': side, 'amount': amount, 'price': self._price}
+
+            def create_market_order(self, symbol, side, amount):
+                # Deterministic failure modes for testing
+                mode = os.getenv('FORCE_FAIL_MODE', '').lower()
+                if mode == 'always':
+                    raise RuntimeError('Simulated deterministic failure (FORCE_FAIL_MODE=always)')
+
+                # deterministic: fail every Nth call when FORCE_FAIL_EVERY_N is set
+                try:
+                    n = int(os.getenv('FORCE_FAIL_EVERY_N', '0') or '0')
+                except Exception:
+                    n = 0
+                if n > 0:
+                    self._fail_counter += 1
+                    if (self._fail_counter % n) == 0:
+                        raise RuntimeError(f'Simulated deterministic failure (every {n}th call)')
+
+                # configurable probabilistic failure rate to trigger circuit-breaker behavior
+                rate = float(os.getenv('FORCE_FAIL_RATE', '0.0'))
+                if rate > 0.0 and random.random() < rate:
+                    raise RuntimeError('Simulated exchange failure')
+
+                return {'id': 'fake-order', 'symbol': symbol, 'side': side, 'amount': amount, 'price': self._price}
+
+        kraken = FakeExchange()
+    else:
+        kraken = get_exchange_client(
+            EXCHANGE_ID,
+            api_key=os.getenv('EXCHANGE_API_KEY') or os.getenv('KRAKEN_API_KEY'),
+            api_secret=os.getenv('EXCHANGE_API_SECRET') or os.getenv('KRAKEN_API_SECRET'),
+            api_passphrase=os.getenv('EXCHANGE_API_PASSPHRASE') or os.getenv('KRAKEN_API_PASSPHRASE'),
+            testnet=False,
+            dry_run=DRY_RUN,
+        )
     # attempt to resolve the symbol name to one accepted by Kraken/ccxt
     def resolve_symbol(desired: str) -> str:
         # try exact first
@@ -176,14 +254,33 @@ def main():
                     logger.warning(f"Model inference failed: {e}")
                     model_action = 0.0
 
-            # create dummy graph inputs required by agent.select_action
-            edge_index = torch.tensor([[0], [0]], dtype=torch.long)
-            graph_node_features = torch.zeros((1, cfg.graph_input_dim), dtype=torch.float32)
+            # create dummy graph inputs required by agent.select_action (use numpy fallbacks when torch unavailable)
+            if HAS_HEAVY_DEPS:
+                try:
+                    edge_index = torch.tensor([[0], [0]], dtype=torch.long)
+                    graph_node_features = torch.zeros((1, cfg.graph_input_dim), dtype=torch.float32)
+                except Exception:
+                    edge_index = None
+                    graph_node_features = np.zeros((1, cfg.graph_input_dim), dtype=np.float32)
+            else:
+                edge_index = None
+                graph_node_features = np.zeros((1, cfg.graph_input_dim), dtype=np.float32)
 
             action = agent.select_action(state, time_step=time_step, edge_index=edge_index, graph_node_features=graph_node_features, eval=True)
 
             # agent.select_action may return a scalar or vector depending on actor
-            a_value = float(np.asarray(action).squeeze().item()) if hasattr(action, 'squeeze') or isinstance(action, (list, tuple, np.ndarray)) else float(action)
+            # normalize agent action to scalar float
+            try:
+                if hasattr(action, 'squeeze') or isinstance(action, (list, tuple, np.ndarray)):
+                    a_value = float(np.asarray(action).squeeze().item())
+                else:
+                    a_value = float(action)
+            except Exception:
+                # fallback when agent returns unexpected type
+                try:
+                    a_value = float(str(action))
+                except Exception:
+                    a_value = 0.0
 
             # Get TradingView-derived signal and convert to an action
             # derive TV action via ported indicators combiner
@@ -212,35 +309,52 @@ def main():
             if abs(combined_action) < deadband:
                 logger.info(f"Combined action {combined_action:.4f} within deadband {deadband}; no trade (agent={a_value:.4f}, tv={tv_action:.4f}, signal={tv_signal})")
             else:
+                # allow forcing an action for demo purposes
+                force_action = os.getenv('FORCE_ACTION')
+                if force_action is not None:
+                    try:
+                        combined_action = float(force_action)
+                    except Exception:
+                        pass
+
                 order_info = kraken.action_to_order(combined_action, RESOLVED_SYMBOL, max_order_usd=MAX_ORDER_USD)
                 if order_info.get('side') is None or order_info.get('amount', 0) <= 0:
                     logger.info(f"No order created from combined action {combined_action}")
                 else:
                     logger.info(f"Placing order (pre-checks): {order_info} (agent={a_value:.4f}, tv={tv_action:.4f}, signal={tv_signal})")
-                    # Safety: check cooldown and position manager limits
-                    if not posman.can_trade():
-                        logger.warning("Trade cooldown active; skipping new order")
+                    # Safety: check cooldown, circuit breaker and position manager limits
+                    if not posman.allow_trade_for_symbol(RESOLVED_SYMBOL):
+                        logger.warning("Trade disallowed by cooldown or circuit breaker; skipping new order")
                     elif posman.would_exceed_limits(order_info['side'], order_info['amount'], order_info['price']):
                         logger.warning("Order would exceed configured position limits; skipping")
                     else:
-                        resp = kraken.create_market_order(SYMBOL, order_info['side'], order_info['amount'])
-                        logger.info(f"Order response: {resp}")
-                        # In dry-run mode, record_trade is optional; here we record for simulation
-                        if DRY_RUN:
-                            posman.record_trade(order_info['side'], order_info['amount'], order_info['price'])
-                            logger.info(f"Simulated position: {posman.current_position()}")
+                        try:
+                            # use helper to execute and automatically record success/failure
+                            # execute_with_cb(posman, symbol, fn, *args)
+                            resp = execute_with_cb(posman, RESOLVED_SYMBOL, lambda s, side, amt: kraken.create_market_order(s, side, amt), SYMBOL, order_info['side'], order_info['amount'])
+                            logger.info(f"Order response: {resp}")
+                            # In dry-run mode, record_trade is optional; here we record for simulation
+                            if DRY_RUN:
+                                posman.record_trade(order_info['side'], order_info['amount'], order_info['price'])
+                                logger.info(f"Simulated position: {posman.current_position()}")
+                        except Exception as e:
+                            logger.error(f"Order execution failed: {e}")
 
                 # Check stop-loss / take-profit: if configured and triggered, close position
                 try:
                     should_close, close_side, close_amount = posman.should_close_for_sl_tp(last_price)
                     if should_close:
                         logger.info(f"SL/TP triggered: closing position {close_side} {close_amount} at {last_price}")
-                        if posman.can_trade():
-                            resp = kraken.create_market_order(SYMBOL, close_side, close_amount)
-                            logger.info(f"SL/TP close order response: {resp}")
-                            if DRY_RUN:
-                                posman.record_trade(close_side, close_amount, last_price)
-                                logger.info(f"Simulated position after SL/TP close: {posman.current_position()}")
+                        if posman.can_trade() and close_side is not None:
+                            try:
+                                # Use execute_with_cb so successes/failures are recorded on the PositionManager
+                                resp = execute_with_cb(posman, RESOLVED_SYMBOL, lambda s, side, amt: kraken.create_market_order(s, side, amt), SYMBOL, close_side, close_amount)
+                                logger.info(f"SL/TP close order response: {resp}")
+                                if DRY_RUN:
+                                    posman.record_trade(close_side, close_amount, last_price)
+                                    logger.info(f"Simulated position after SL/TP close: {posman.current_position()}")
+                            except Exception as e:
+                                logger.error(f"SL/TP close failed: {e}")
                         else:
                             logger.warning("SL/TP close suppressed due to cooldown")
                 except Exception as e:

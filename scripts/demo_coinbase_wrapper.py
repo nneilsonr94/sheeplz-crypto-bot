@@ -12,6 +12,7 @@ This script accepts both environment variables and CLI flags. CLI flags override
 import os
 import argparse
 from exchanges import coinbase_advanced_wrapper as cbw
+from exchanges.exchange_utils import execute_with_cb
 
 
 def parse_args():
@@ -42,7 +43,20 @@ def main():
     order = client.action_to_order(args.action, sym, max_order_usd=args.max_order_usd)
     print('\naction_to_order(%s) =>' % args.action, order)
 
-    resp = client.create_market_order(sym, order.get('side'), order.get('amount'), params={'price': order.get('price'), 'usd_notional': order.get('usd_notional')})
+    # Execute via helper so demo records successes/failures when integrated with PositionManager
+    # For this standalone demo we create a tiny dummy posman to satisfy the helper signature.
+    class _DummyPM:
+        def record_success_for_symbol(self, symbol):
+            pass
+        def record_failure_for_symbol(self, symbol):
+            pass
+
+    dummy_pm = _DummyPM()
+    resp = None
+    try:
+        resp = execute_with_cb(dummy_pm, sym, lambda s, side, amt, params=None: client.create_market_order(s, side, amt, params=params), sym, order.get('side'), order.get('amount'), {'price': order.get('price'), 'usd_notional': order.get('usd_notional')})
+    except Exception as e:
+        resp = {'error': str(e)}
     print('\ncreate_market_order =>', resp)
 
 
