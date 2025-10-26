@@ -46,3 +46,31 @@ jobs:
         run: |
           # These tests require local services; they will be skipped unless services are configured.
           pytest -q vendor/pantheon-server -k "not slow"
+
+  smoke-demo:
+    name: Post-merge smoke: run fake-exchange demo (dry-run)
+    runs-on: ubuntu-latest
+    # run only on pushes to main (post-merge) or when tags are pushed
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Install lightweight deps
+        run: |
+          python -m pip install --upgrade pip
+          # try to install requirements but don't fail the job if optional heavy deps are missing
+          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+          pip install joblib || true
+      - name: Run fake-exchange demo (dry-run)
+        env:
+          USE_FAKE_EXCHANGE: '1'
+          DRY_RUN: '1'
+          RUN_STEPS: '6'
+          POLL_INTERVAL: '0.5'
+          FORCE_ACTION: '1.0'
+        run: |
+          # Execute the demo loop in dry-run fake-exchange mode. The script is resilient to missing heavy deps.
+          python run_live.py
