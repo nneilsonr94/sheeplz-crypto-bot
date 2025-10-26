@@ -6,7 +6,8 @@ orders. It works in paper/dry-run mode and can be extended later to persist
 positions or sync with exchange state.
 """
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict
+from exchanges.circuit_breaker import CircuitBreaker
 
 
 @dataclass
@@ -27,6 +28,36 @@ class PositionManager:
         self.avg_entry_price = None
         self._last_trade_ts = 0.0
         self.audit_path = None
+        # per-symbol circuit breakers (lazy-created)
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
+
+    def set_circuit_breaker_for_symbol(self, symbol: str, cb: CircuitBreaker) -> None:
+        """Explicitly set a CircuitBreaker instance for a symbol."""
+        self._circuit_breakers[symbol] = cb
+
+    def _get_cb(self, symbol: str) -> CircuitBreaker:
+        cb = self._circuit_breakers.get(symbol)
+        if cb is None:
+            cb = CircuitBreaker()
+            self._circuit_breakers[symbol] = cb
+        return cb
+
+    def allow_trade_for_symbol(self, symbol: str, now_ts: Optional[float] = None) -> bool:
+        """Return True if trading is allowed for this symbol (cooldown + circuit breaker)."""
+        if not self.can_trade(now_ts=now_ts):
+            return False
+        cb = self._get_cb(symbol)
+        return cb.allow_request()
+
+    def record_failure_for_symbol(self, symbol: str) -> None:
+        """Record a failed attempt that should count towards the circuit breaker for the symbol."""
+        cb = self._get_cb(symbol)
+        cb.record_failure()
+
+    def record_success_for_symbol(self, symbol: str) -> None:
+        """Record a successful execution for the symbol (resets the breaker)."""
+        cb = self._get_cb(symbol)
+        cb.record_success()
 
     def current_position(self):
         return {"base": self.position_base, "avg_entry_price": self.avg_entry_price}
