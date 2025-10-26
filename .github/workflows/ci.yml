@@ -5,6 +5,9 @@ on:
     branches: [ main, feature/** ]
   pull_request:
     branches: [ main ]
+  schedule:
+    # daily smoke demo run at 06:00 UTC
+    - cron: '0 6 * * *'
 
 jobs:
   unit-tests:
@@ -50,8 +53,8 @@ jobs:
   smoke-demo:
     name: Post-merge smoke: run fake-exchange demo (dry-run)
     runs-on: ubuntu-latest
-    # run only on pushes to main (post-merge) or when tags are pushed
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    # run only on tags (release validation)
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
