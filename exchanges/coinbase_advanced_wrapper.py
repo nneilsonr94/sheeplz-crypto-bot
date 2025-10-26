@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any, Optional
 import logging
 import importlib
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -92,21 +93,157 @@ def get_client(api_key: Optional[str] = None, api_secret: Optional[str] = None, 
         if factory:
             client_obj = factory(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase, dry_run=dry_run)
         else:
-            # special-case coinbase.rest.RESTClient
+            # special-case coinbase.rest.RESTClient. Some distributions expose
+            # the REST client in a submodule (coinbase.rest) but don't bind
+            # it to the top-level package object, so try importing the
+            # submodule if the attribute isn't present. Attempt multiple
+            # common ctor signatures (kwarg name variants, base_url, timeout,
+            # and a handful of positional signatures) to be resilient across
+            # packaging differences.
             rest_cli = getattr(mod, 'rest', None)
-            if rest_cli and hasattr(rest_cli, 'RESTClient'):
+            if rest_cli is None:
                 try:
-                    # Prefer direct RESTClient instantiation for the official coinbase package
-                    client_obj = rest_cli.RESTClient(api_key=api_key, api_secret=api_secret)
-                    logger.info('Instantiated coinbase.rest.RESTClient from installed package')
-                except Exception as e:
-                    # try again with positional args
+                    rest_cli = importlib.import_module(f"{mod.__name__}.rest")
+                except Exception:
+                    rest_cli = None
+            if rest_cli and hasattr(rest_cli, 'RESTClient'):
+                REST = getattr(rest_cli, 'RESTClient')
+                client_obj = None
+                errors = []
+
+                # Prefer credentialed construction when credentials are provided
+                provided_api_key = api_key if api_key is not None else os.environ.get('EXCHANGE_API_KEY')
+                provided_api_secret = api_secret if api_secret is not None else os.environ.get('EXCHANGE_API_SECRET')
+                provided_api_passphrase = api_passphrase if api_passphrase is not None else os.environ.get('EXCHANGE_API_PASSPHRASE')
+                prefer_creds = bool(provided_api_key or provided_api_secret or provided_api_passphrase)
+
+                # Build a set of candidate kwarg name combinations and values
+                key_names = ['api_key', 'apiKey', 'key', 'key_file', 'keyfile']
+                secret_names = ['api_secret', 'apiSecret', 'secret', 'secret_key']
+                passphrase_names = ['api_passphrase', 'passphrase', 'passphrase_key']
+                base_urls = [None, 'https://api.coinbase.com', 'https://api.exchange.coinbase.com']
+                timeouts = [None, 10, 30]
+
+                # Try a set of candidate kwarg dicts
+                candidates = []
+                for kn in key_names:
+                    for sn in secret_names:
+                        for pn in passphrase_names:
+                            for bu in base_urls:
+                                for to in timeouts:
+                                    params = {}
+                                    if provided_api_key is not None:
+                                        params[kn] = provided_api_key
+                                    if provided_api_secret is not None:
+                                        params[sn] = provided_api_secret
+                                    if provided_api_passphrase is not None:
+                                        params[pn] = provided_api_passphrase
+                                    if bu is not None:
+                                        params['base_url'] = bu
+                                    if to is not None:
+                                        params['timeout'] = to
+                                    # only attempt if we added at least one param
+                                    if params:
+                                        candidates.append(params)
+
+                # Add a small set of positional attempts too
+                positional_attempts = []
+                if provided_api_key is not None and provided_api_secret is not None and provided_api_passphrase is not None:
+                    positional_attempts.append((provided_api_key, provided_api_secret, provided_api_passphrase))
+                if provided_api_key is not None and provided_api_secret is not None:
+                    positional_attempts.append((provided_api_key, provided_api_secret))
+                if provided_api_key is not None:
+                    positional_attempts.append((provided_api_key,))
+
+                # If credentials look available, prefer credentialed attempts first,
+                # otherwise try no-arg public client first.
+                if prefer_creds:
+                    # Try kwarg candidates first
+                    for params in candidates:
+                        try:
+                            client_obj = REST(**params)
+                            logger.info('Instantiated coinbase.rest.RESTClient from installed package using kwargs: %s', list(params.keys()))
+                            break
+                        except TypeError as te:
+                            errors.append(f'TypeError({list(params.keys())}): {te}')
+                            continue
+                        except Exception as e:
+                            errors.append(f'Error({list(params.keys())}): {e}')
+                            continue
+
+                    # Try positional attempts if kwarg attempts failed
+                    if client_obj is None:
+                        for args in positional_attempts:
+                            try:
+                                client_obj = REST(*args)
+                                logger.info('Instantiated coinbase.rest.RESTClient from installed package using positional args')
+                                break
+                            except Exception as e:
+                                errors.append(f'PositionalError({args}): {e}')
+                                continue
+
+                    # Fallback to no-arg public client if still None
+                    if client_obj is None:
+                        try:
+                            client_obj = REST()
+                            logger.info('Instantiated coinbase.rest.RESTClient with no args (public client) as fallback')
+                        except Exception:
+                            client_obj = None
+                else:
+                    # Try no-arg constructor first (public endpoints)
                     try:
-                        client_obj = rest_cli.RESTClient(api_key, api_secret)
-                        logger.info('Instantiated coinbase.rest.RESTClient (positional args)')
-                    except Exception as e2:
-                        logger.warning(f'Failed to instantiate coinbase.rest.RESTClient: {e}; {e2}')
+                        client_obj = REST()
+                        logger.info('Instantiated coinbase.rest.RESTClient with no args (public client)')
+                    except Exception:
                         client_obj = None
+
+                    # Then try credentialed kwarg/positional attempts
+                    for params in candidates:
+                        try:
+                            client_obj = REST(**params)
+                            logger.info('Instantiated coinbase.rest.RESTClient from installed package using kwargs: %s', list(params.keys()))
+                            break
+                        except TypeError as te:
+                            errors.append(f'TypeError({list(params.keys())}): {te}')
+                            continue
+                        except Exception as e:
+                            errors.append(f'Error({list(params.keys())}): {e}')
+                            continue
+
+                    if client_obj is None:
+                        for args in positional_attempts:
+                            try:
+                                client_obj = REST(*args)
+                                logger.info('Instantiated coinbase.rest.RESTClient from installed package using positional args')
+                                break
+                            except Exception as e:
+                                errors.append(f'PositionalError({args}): {e}')
+                                continue
+                    try:
+                        client_obj = REST(**params)
+                        logger.info('Instantiated coinbase.rest.RESTClient from installed package using kwargs: %s', list(params.keys()))
+                        break
+                    except TypeError as te:
+                        # signature mismatch -- try next
+                        errors.append(f'TypeError({list(params.keys())}): {te}')
+                        continue
+                    except Exception as e:
+                        errors.append(f'Error({list(params.keys())}): {e}')
+                        continue
+
+                # Try positional attempts if kwarg attempts failed
+                if client_obj is None:
+                    for args in positional_attempts:
+                        try:
+                            client_obj = REST(*args)
+                            logger.info('Instantiated coinbase.rest.RESTClient from installed package using positional args')
+                            break
+                        except Exception as e:
+                            errors.append(f'PositionalError({args}): {e}')
+                            continue
+
+                if client_obj is None:
+                    logger.warning('Failed to instantiate coinbase.rest.RESTClient; attempted many common signatures. Details: %s', errors)
             else:
                 # try some common class names
                 for cls_name in ('AdvancedTradeClient', 'AdvancedClient', 'Client', 'CoinbaseAdvanced'):
@@ -147,16 +284,52 @@ def get_client(api_key: Optional[str] = None, api_secret: Optional[str] = None, 
             self.markets = getattr(client, 'markets', {}) or getattr(client, 'symbols', {}) or {}
 
         def fetch_ticker(self, symbol: str):
-            # try a few method names (cover common client variants)
+            # normalize symbol to Coinbase product_id format (e.g. BTC/USD -> BTC-USD)
+            prod = symbol.replace('/', '-').replace('_', '-').replace('XBT', 'BTC')
+
+            # Prefer public product helpers which return a market-level view
+            public_candidates = ('get_public_product', 'get_public_products', 'get_product', 'get_best_bid_ask', 'get_public_market_trades', 'get_market_trades')
+            for meth in public_candidates:
+                fn = getattr(self._c, meth, None)
+                if callable(fn):
+                    try:
+                        # Many of these accept a single product_id positional arg
+                        res = fn(prod)
+                        if isinstance(res, (int, float, str)):
+                            return {'last': str(res), 'volume': '0'}
+                        # normalize dict-like responses
+                        if isinstance(res, dict):
+                            if 'price' in res:
+                                return {'last': str(res.get('price')), 'volume': str(res.get('volume_24h', '0'))}
+                            if 'mid_market_price' in res and res.get('mid_market_price'):
+                                return {'last': str(res.get('mid_market_price')), 'volume': '0'}
+                            return res
+                        # normalize object-style responses (e.g., GetProductResponse)
+                        try:
+                            price = getattr(res, 'price', None) or getattr(res, 'mid_market_price', None)
+                            volume = getattr(res, 'volume_24h', None) or getattr(res, 'volume', None)
+                            if price is not None:
+                                return {'last': str(price), 'volume': str(volume or '0')}
+                        except Exception:
+                            pass
+                        return res
+                    except TypeError:
+                        # signature mismatch, try next candidate
+                        continue
+                    except Exception:
+                        # method exists but raised (e.g., requires auth) -> try next
+                        continue
+
+            # try a few generic method names as a last resort (cover other client variants)
             fetch_candidates = (
                 'fetch_ticker', 'get_ticker', 'ticker', 'get_ticker_for_symbol',
-                'get_product_ticker', 'get_product', 'get_latest_price', 'get_price', 'get_market_price', 'price', 'ticker_for'
+                'get_product_ticker', 'get_latest_price', 'get_price', 'get_market_price', 'price', 'ticker_for'
             )
             for meth in fetch_candidates:
                 fn = getattr(self._c, meth, None)
                 if callable(fn):
                     # try common call signatures
-                    for args, kwargs in (([symbol], {}), ([], {'product_id': symbol}), ([], {'symbol': symbol}), ([], {})):
+                    for args, kwargs in (([symbol], {}), ([], {'product_id': prod}), ([], {'symbol': prod}), ([], {})):
                         try:
                             res = fn(*args, **kwargs)
                             # normalize simple numeric responses
