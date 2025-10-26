@@ -2,7 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased] - 2025-10-26
+## [Unreleased]
+
+## [v0.1.0] - 2025-10-26
 
 ### Added
 - Coinbase Advanced wrapper: enhanced detection for "Enhanced-style" clients that expose fiat helpers; runtime logging when those helpers are used. (`exchanges/coinbase_advanced_wrapper.py`)
