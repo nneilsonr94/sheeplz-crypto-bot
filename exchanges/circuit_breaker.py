@@ -9,6 +9,7 @@ import time
 from enum import Enum
 import logging
 from typing import Optional
+from exchanges import metrics
 
 
 class State(Enum):
@@ -72,6 +73,10 @@ class CircuitBreaker:
                 self._logger.warning("CircuitBreaker opened after %s failures", self._fail_count)
             except Exception:
                 pass
+            try:
+                metrics.inc_cb_open()
+            except Exception:
+                logging.getLogger(__name__).exception('Failed to increment cb_open metric')
             logging.getLogger(__name__).warning(
                 "CircuitBreaker opened (threshold=%s) at %s",
                 self.failure_threshold,

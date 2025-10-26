@@ -13,6 +13,7 @@ Short ops notes: recommended production env vars and safety checklist.
 - PM_STOP_LOSS_PCT / PM_TAKE_PROFIT_PCT: stop-loss / take-profit percentages
 - MODEL_1MIN_PATH: path to 1-minute model artifact (if used)
 
+<<<<<<< HEAD
 ### Suggested default values (example)
 - DRY_RUN=1
 - MAX_ACCOUNT_NOTIONAL_USD=1000
@@ -24,6 +25,41 @@ Short ops notes: recommended production env vars and safety checklist.
 ## Deployment (example: systemd service)
 Below is an example `systemd` unit file you can adapt for running the live loop on a server. It assumes you use a virtualenv at `/opt/sheeplz/venv` and a deploy user `sleeper`.
 
+Create file `/etc/systemd/system/sheeplz-live.service` with the following content:
+
+```ini
+[Unit]
+Description=Sheeplz Crypto Bot live runner
+After=network.target
+
+[Service]
+Type=simple
+User=sleeper
+# sheeplz-crypto-bot
+
+Short ops notes: recommended production env vars and safety checklist.
+
+## Recommended production environment variables
+- EXCHANGE: exchange id to use (e.g. `coinbase_advanced` or `kraken`)
+- EXCHANGE_API_KEY / EXCHANGE_API_SECRET / EXCHANGE_API_PASSPHRASE: credentials stored in secrets
+- DRY_RUN: set to `0` for live trading; keep `1` by default during rollout
+- RUN_STEPS: leave unset for continuous running; set small integer for smoke tests
+- MAX_ACCOUNT_NOTIONAL_USD: maximum USD exposure allowed by PositionManager
+- MIN_ORDER_USD: smallest order notional permitted
+- PM_COOLDOWN_SECONDS: cooldown between trades enforced by PositionManager
+- PM_STOP_LOSS_PCT / PM_TAKE_PROFIT_PCT: stop-loss / take-profit percentages
+- MODEL_1MIN_PATH: path to 1-minute model artifact (if used)
+
+### Suggested default values (example)
+- DRY_RUN=1
+- MAX_ACCOUNT_NOTIONAL_USD=1000
+- MIN_ORDER_USD=1.0
+- PM_COOLDOWN_SECONDS=5
+- PM_STOP_LOSS_PCT=0.05
+- PM_TAKE_PROFIT_PCT=0.1
+
+## Deployment (example: systemd service)
+Below is an example `systemd` unit file you can adapt for running the live loop on a server. It assumes you use a virtualenv at `/opt/sheeplz/venv` and a deploy user `sleeper`.
 Create file `/etc/systemd/system/sheeplz-live.service` with the following content:
 
 ```ini
